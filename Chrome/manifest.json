@@ -1,0 +1,36 @@
+{
+    "manifest_version": 3,
+    "name": "OkechikaTranslater",
+    "version": "0.1.0",
+    "description": "換字で暗号化されたページの本文テキストを、スプレッドシートの対応表で置換して表示します。",
+    "icons": {
+        "16": "icons/icon.png",
+        "48": "icons/icon.png",
+        "128": "icons/icon.png"
+    },
+    "permissions": [
+        "storage"
+    ],
+    "host_permissions": [
+        "https://docs.google.com/spreadsheets/*"
+    ],
+    "background": {
+        "service_worker": "background.js"
+    },
+    "content_scripts": [
+        {
+            "matches": [
+                "<all_urls>"
+            ],
+            "all_frames": true,
+            "match_about_blank": true,
+            "exclude_matches": [
+                "*://chrome.google.com/webstore/*"
+            ],
+            "js": [
+                "content.js"
+            ],
+            "run_at": "document_idle"
+        }
+    ]
+}

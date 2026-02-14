@@ -1,0 +1,570 @@
+const IGNORED_TAGS = new Set([
+    "SCRIPT",
+    "STYLE",
+    "TEXTAREA",
+    "INPUT",
+    "NOSCRIPT"
+]);
+
+const ENABLED_KEY = "okechikaEnabled";
+
+function shouldIgnoreTextNode(textNode) {
+    const parent = textNode.parentElement;
+    if (!parent) return true;
+    if (IGNORED_TAGS.has(parent.tagName)) return true;
+    const editable = parent.closest("[contenteditable='true']");
+    if (editable) {
+        // 表示専用ビューアが contenteditable を使うことがあるため、
+        // ユーザーが操作中（フォーカス中）のときだけ避ける。
+        const active = document.activeElement;
+        if (active && editable.contains(active)) return true;
+    }
+    return false;
+}
+
+function buildReplacer(mapping) {
+    const entries = Object.entries(mapping ?? {});
+    if (entries.length === 0) return null;
+
+    // 置換元が1文字とは限らない想定で、長いキーを優先して置換
+    entries.sort((a, b) => b[0].length - a[0].length);
+
+    const keys = entries.map(([k]) => k);
+    const escapedKeys = keys.map((k) => k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    const re = new RegExp(escapedKeys.join("|"), "g");
+    const map = new Map(entries);
+
+    return (text) => text.replace(re, (m) => map.get(m) ?? m);
+}
+
+function buildMatchRegex(mapping) {
+    const entries = Object.entries(mapping ?? {});
+    if (entries.length === 0) return null;
+    entries.sort((a, b) => b[0].length - a[0].length);
+    const escapedKeys = entries
+        .map(([k]) => k)
+        .filter((k) => typeof k === "string" && k.length > 0)
+        .map((k) => k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    if (escapedKeys.length === 0) return null;
+    return new RegExp(escapedKeys.join("|"), "g");
+}
+
+function countMatchesInText(text, re) {
+    if (!text || !re) return 0;
+    re.lastIndex = 0;
+    let count = 0;
+    while (re.exec(text)) {
+        count++;
+        // 念のため無限ループ防止（空文字マッチは発生しない想定だが保険）
+        if (re.lastIndex === 0) break;
+    }
+    re.lastIndex = 0;
+    return count;
+}
+
+function estimateMatchesInRoot(root, re) {
+    if (!re) return 0;
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    let total = 0;
+    let n;
+    while ((n = walker.nextNode())) {
+        if (shouldIgnoreTextNode(n)) continue;
+        const before = n.nodeValue;
+        if (!before || before.trim().length === 0) continue;
+        total += countMatchesInText(before, re);
+    }
+    return total;
+}
+
+function ensureDefaultFontStyle() {
+    const id = "okechika-translater-font";
+    if (document.getElementById(id)) return;
+    const style = document.createElement("style");
+    style.id = id;
+    // 暗号用フォントに引っ張られないよう、読みやすい日本語サンセリフを優先
+    // ページが Noto Sans JP を読み込んでいない場合でも、他の一般的なフォントへフォールバックする
+    const fontStack = [
+        '"Noto Sans JP"',
+        '"Noto Sans CJK JP"',
+        '"Hiragino Sans"',
+        '"Yu Gothic"',
+        'Meiryo',
+        'system-ui',
+        'sans-serif'
+    ].join(",");
+    style.textContent = `.okechika-translated{font-family:${fontStack} !important;}`;
+    document.documentElement.appendChild(style);
+}
+
+function canWrapWithSpan(parentEl) {
+    if (!parentEl) return false;
+    const tag = parentEl.tagName;
+    // span を子に置けない要素を避ける
+    if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT") return false;
+    if (tag === "HEAD" || tag === "HTML") return false;
+    return true;
+}
+
+function translateRoot(root, replaceFn) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const nodes = [];
+
+    let n;
+    while ((n = walker.nextNode())) {
+        nodes.push(n);
+    }
+
+    let changedNodes = 0;
+    const samples = [];
+
+    for (const textNode of nodes) {
+        if (shouldIgnoreTextNode(textNode)) continue;
+
+        const before = textNode.nodeValue;
+        if (!before || before.trim().length === 0) continue;
+
+        const after = replaceFn(before);
+        if (after !== before) {
+            const parent = textNode.parentElement;
+            if (parent && parent.classList?.contains("okechika-translated")) {
+                textNode.nodeValue = after;
+            } else if (parent && canWrapWithSpan(parent)) {
+                ensureDefaultFontStyle();
+                const span = document.createElement("span");
+                span.className = "okechika-translated";
+                span.dataset.okechikaOriginal = before;
+                span.textContent = after;
+                parent.replaceChild(span, textNode);
+            } else {
+                textNode.nodeValue = after;
+            }
+            changedNodes++;
+            if (samples.length < 3) {
+                samples.push({ before: before.slice(0, 80), after: after.slice(0, 80) });
+            }
+        }
+    }
+
+    return { changedNodes, samples };
+}
+
+function translateFormFields(root, replaceFn) {
+    let changed = 0;
+
+    const nodes = root.querySelectorAll?.(
+        "textarea, input:not([type]), input[type='text'], input[type='search'], input[type='url'], input[type='email'], input[type='tel']"
+    );
+    if (!nodes) return changed;
+
+    for (const el of nodes) {
+        try {
+            const tag = el.tagName;
+            const isActive = document.activeElement === el;
+            // 入力中は触らない
+            if (isActive) continue;
+
+            const before = tag === "TEXTAREA" ? el.value : el.value;
+            if (!before || before.trim().length === 0) continue;
+
+            const after = replaceFn(before);
+            if (after !== before) {
+                if (!el.dataset.okechikaOriginal) el.dataset.okechikaOriginal = before;
+                el.value = after;
+                try {
+                    // フィールド自体も暗号用フォントを避ける
+                    el.style.fontFamily = '"Noto Sans JP","Noto Sans CJK JP","Hiragino Sans","Yu Gothic",Meiryo,system-ui,sans-serif';
+                } catch {
+                    // ignore
+                }
+                changed++;
+            }
+        } catch {
+            // ignore
+        }
+    }
+
+    return changed;
+}
+
+function collectOpenShadowRoots(root) {
+    const roots = [];
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+    let n;
+    while ((n = walker.nextNode())) {
+        if (n.shadowRoot) roots.push(n.shadowRoot);
+    }
+    // ネストした shadow root も拾う
+    for (let i = 0; i < roots.length; i++) {
+        const sr = roots[i];
+        const inner = document.createTreeWalker(sr, NodeFilter.SHOW_ELEMENT);
+        let e;
+        while ((e = inner.nextNode())) {
+            if (e.shadowRoot) roots.push(e.shadowRoot);
+        }
+    }
+    return roots;
+}
+
+function reverseMapping(mapping) {
+    const reversed = {};
+    for (const [k, v] of Object.entries(mapping ?? {})) {
+        if (!k || !v) continue;
+        // 衝突した場合は先勝ち（ここでは安定性優先で上書きしない）
+        if (reversed[v] === undefined) reversed[v] = k;
+    }
+    return reversed;
+}
+
+async function getMappingFromBackground() {
+    try {
+        const res = await chrome.runtime.sendMessage({ type: "GET_MAPPING" });
+        return res ?? null;
+    } catch {
+        return null;
+    }
+}
+
+async function refreshMappingInBackground() {
+    try {
+        const res = await chrome.runtime.sendMessage({ type: "REFRESH_MAPPING" });
+        return res ?? null;
+    } catch {
+        return null;
+    }
+}
+
+function showMappingErrorBanner(info) {
+    // ユーザー要望: 「置換が適用されません」系の警告バナーは不要。
+    // 対応表取得失敗などの実エラー（ok:false）のみ表示する。
+    if (info?.warning) return;
+
+    // 特殊なdocument（ごく稀）ではdocumentElementが無いことがある
+    if (!document?.documentElement) return;
+
+    const id = "okechika-translater-error";
+    if (document.getElementById(id)) return;
+
+    const box = document.createElement("div");
+    box.id = id;
+    box.style.position = "fixed";
+    box.style.left = "12px";
+    box.style.right = "12px";
+    box.style.bottom = "12px";
+    box.style.zIndex = "2147483647";
+    box.style.padding = "10px 12px";
+    box.style.border = "1px solid #d0d0d0";
+    box.style.background = "#ffffff";
+    box.style.color = "#111111";
+    box.style.font = "12px/1.4 system-ui, -apple-system, Segoe UI, sans-serif";
+    box.style.maxHeight = "35vh";
+    box.style.overflow = "auto";
+
+    const title = document.createElement("div");
+    title.textContent = info?.warning
+        ? "OkechikaTranslater: 置換が適用されません"
+        : "OkechikaTranslater: 対応表を取得できません";
+    title.style.fontWeight = "600";
+    title.style.marginBottom = "4px";
+
+    const body = document.createElement("div");
+    const status = info?.status ? ` (HTTP ${info.status})` : "";
+    const hint = info?.warning
+        ? "対応表の読み込みは成功しましたが、ページ本文で置換対象が見つかりませんでした。暗号文が画像/Canvas/閉じたShadow DOM内の場合や、対応表の向きが逆の場合に起きます。"
+        : info?.messageFailure
+            ? "拡張機能のバックグラウンドに接続できません。このページでは拡張が動作しないか、拡張が無効/未読み込みの可能性があります。"
+            : info?.privateOrAuthRequired
+                ? "スプレッドシートが非公開、または閲覧にログインが必要な可能性があります。"
+                : "スプレッドシートが公開（リンク閲覧可 / ウェブに公開）になっているか確認してください。";
+    const errText = info?.error ? `\n詳細: ${info.error}${status}` : "";
+    const countsText =
+        typeof info?.changedTextNodes === "number" || typeof info?.changedFields === "number"
+            ? `\n置換: テキスト ${info.changedTextNodes ?? 0} 件 / フィールド ${info.changedFields ?? 0} 件`
+            : "";
+    body.textContent = `${hint}${errText}${countsText}`;
+
+    box.appendChild(title);
+    box.appendChild(body);
+
+    document.documentElement.appendChild(box);
+}
+
+async function getEnabledFlag() {
+    try {
+        const obj = await chrome.storage.local.get(ENABLED_KEY);
+        const v = obj?.[ENABLED_KEY];
+        return v === undefined ? true : Boolean(v);
+    } catch {
+        return true;
+    }
+}
+
+function restoreTranslatedInRoot(root) {
+    try {
+        const spans = root.querySelectorAll?.("span.okechika-translated[data-okechika-original]");
+        if (spans) {
+            for (const span of spans) {
+                const original = span.dataset.okechikaOriginal;
+                if (original === undefined) continue;
+                span.replaceWith(document.createTextNode(original));
+            }
+        }
+
+        const fields = root.querySelectorAll?.("textarea[data-okechika-original], input[data-okechika-original]");
+        if (fields) {
+            for (const el of fields) {
+                const original = el.dataset.okechikaOriginal;
+                if (original === undefined) continue;
+                el.value = original;
+                try {
+                    delete el.dataset.okechikaOriginal;
+                } catch {
+                    // ignore
+                }
+            }
+        }
+    } catch {
+        // ignore
+    }
+}
+
+(async () => {
+    try {
+        console.info("[OkechikaTranslater] content script loaded", location.href);
+
+        if (!document.body) {
+            await new Promise((resolve) => {
+                document.addEventListener("DOMContentLoaded", resolve, { once: true });
+            });
+        }
+
+        if (!document.body) {
+            throw new Error("document.body is not available");
+        }
+
+        let enabled = await getEnabledFlag();
+        let observer = null;
+        let replaceFn = null;
+
+        function stopAndRestore() {
+            try {
+                observer?.disconnect();
+            } catch {
+                // ignore
+            }
+            observer = null;
+
+            restoreTranslatedInRoot(document.body);
+            for (const sr of collectOpenShadowRoots(document.body)) {
+                restoreTranslatedInRoot(sr);
+            }
+        }
+
+        async function startIfNeeded() {
+            if (!enabled) return;
+            if (observer) return;
+
+            // まずは対応表の更新を試みる（onInstalled/onStartup が走っていない場合もあるため）
+            const refreshResult = await refreshMappingInBackground();
+            if (refreshResult && refreshResult.ok === false) {
+                console.warn("[OkechikaTranslater] refresh failed", refreshResult);
+            }
+
+            const result = await getMappingFromBackground();
+            if (!result) {
+                showMappingErrorBanner({ ok: false, error: "Failed to message background", messageFailure: true });
+                console.warn("[OkechikaTranslater] failed to get mapping (message failed)");
+                return;
+            }
+
+            if (!result.ok) {
+                showMappingErrorBanner(result);
+                console.warn("[OkechikaTranslater] mapping not ok", result);
+                return;
+            }
+
+            const mapping = result.mapping ?? null;
+            if (!mapping) {
+                showMappingErrorBanner({ ok: false, error: "No mapping in storage" });
+                console.warn("[OkechikaTranslater] no mapping in storage");
+                return;
+            }
+
+            // マッピング方向は forward 固定（A列→B列）。
+            // 数字変換（例: ソ→28）が入ると reverse 自動判定が誤作動しやすいため。
+            console.info("[OkechikaTranslater] mapping direction", { chosen: "forward" });
+
+            replaceFn = buildReplacer(mapping);
+            if (!replaceFn) {
+                showMappingErrorBanner({ ok: false, error: "Mapping is empty" });
+                console.warn("[OkechikaTranslater] mapping is empty");
+                return;
+            }
+
+        function translateAllRoots(fn) {
+            let changedTextNodes = 0;
+            let changedFields = 0;
+            const sampleChanges = [];
+
+            const r1 = translateRoot(document.body, fn);
+            changedTextNodes += r1.changedNodes;
+            sampleChanges.push(...r1.samples);
+            changedFields += translateFormFields(document.body, fn);
+
+            for (const sr of collectOpenShadowRoots(document.body)) {
+                const r = translateRoot(sr, fn);
+                changedTextNodes += r.changedNodes;
+                sampleChanges.push(...r.samples);
+                // shadow root 内の input/textarea は基本少ないが、一応
+                try {
+                    changedFields += translateFormFields(sr, fn);
+                } catch {
+                    // ignore
+                }
+            }
+
+            return { changedTextNodes, changedFields, sampleChanges: sampleChanges.slice(0, 3) };
+        }
+
+            // 初回翻訳
+            let changed = translateAllRoots(replaceFn);
+
+        const totalReplacements = (changed.changedTextNodes ?? 0) + (changed.changedFields ?? 0);
+        if (totalReplacements === 0) {
+            showMappingErrorBanner({ warning: true, error: "0 replacements", ...changed });
+            console.warn("[OkechikaTranslater] 0 replacements; nothing to translate");
+        } else {
+            console.info("[OkechikaTranslater] initial replacements", changed);
+
+            // 少なすぎる場合は、ユーザーが見ている本文に効いていない可能性が高いので注意喚起
+            if (totalReplacements < 10) {
+                showMappingErrorBanner({ warning: true, error: "Too few replacements", ...changed });
+                console.warn("[OkechikaTranslater] too few replacements", changed);
+            }
+        }
+
+            // SPA/ビューアで遅れて描画される場合があるので、数回だけ再実行
+            const retryDelaysMs = [500, 1500, 3000];
+            for (const d of retryDelaysMs) {
+                setTimeout(() => {
+                    try {
+                        if (!enabled) return;
+                        const retry = translateAllRoots(replaceFn);
+                        const retryTotal = (retry.changedTextNodes ?? 0) + (retry.changedFields ?? 0);
+                        if (retryTotal > 0) {
+                            console.info("[OkechikaTranslater] retry replacements", { delayMs: d, ...retry });
+                        }
+                    } catch {
+                        // ignore
+                    }
+                }, d);
+            }
+
+        // 追加・更新された箇所を翻訳
+        let scheduled = false;
+        const pendingRoots = new Set();
+        let isApplying = false;
+
+        function scheduleTranslate(observer) {
+            if (scheduled) return;
+            scheduled = true;
+            queueMicrotask(() => {
+                scheduled = false;
+                const roots = Array.from(pendingRoots);
+                pendingRoots.clear();
+
+                if (isApplying) return;
+                isApplying = true;
+                try {
+                    for (const r of roots) {
+                        if (!r) continue;
+                        if (r.nodeType === Node.ELEMENT_NODE || r.nodeType === Node.DOCUMENT_FRAGMENT_NODE) {
+                            try {
+                                translateRoot(r, replaceFn);
+                            } catch {
+                                // ignore
+                            }
+                            try {
+                                if (r.nodeType === Node.ELEMENT_NODE) translateFormFields(r, replaceFn);
+                            } catch {
+                                // ignore
+                            }
+                        }
+                    }
+
+                    // 新規に追加された open shadow root も追従
+                    for (const sr of collectOpenShadowRoots(document.body)) {
+                        try {
+                            translateRoot(sr, replaceFn);
+                        } catch {
+                            // ignore
+                        }
+                        try {
+                            translateFormFields(sr, replaceFn);
+                        } catch {
+                            // ignore
+                        }
+                    }
+                } finally {
+                    isApplying = false;
+                }
+            });
+        }
+
+            observer = new MutationObserver((mutations) => {
+            for (const m of mutations) {
+                if (m.type === "characterData") {
+                    if (m.target?.nodeType === Node.TEXT_NODE) {
+                        pendingRoots.add(m.target.parentElement ?? document.body);
+                    }
+                    continue;
+                }
+
+                if (m.type === "childList") {
+                    for (const node of m.addedNodes) {
+                        if (node.nodeType === Node.ELEMENT_NODE) pendingRoots.add(node);
+                        else if (node.nodeType === Node.TEXT_NODE) pendingRoots.add(node.parentElement ?? document.body);
+                    }
+                }
+            }
+
+            if (!enabled) return;
+            scheduleTranslate(observer);
+        });
+
+            observer.observe(document.body, {
+            childList: true,
+            subtree: true,
+            characterData: true
+        });
+        }
+
+        // 初期状態に応じて開始
+        await startIfNeeded();
+
+        // ポップアップの切替に追従
+        try {
+            chrome.storage.onChanged.addListener((changes, areaName) => {
+                if (areaName !== "local") return;
+                if (!changes || !Object.prototype.hasOwnProperty.call(changes, ENABLED_KEY)) return;
+                const newValue = changes[ENABLED_KEY]?.newValue;
+                const next = newValue === undefined ? true : Boolean(newValue);
+                if (next === enabled) return;
+                enabled = next;
+                if (enabled) {
+                    startIfNeeded();
+                } else {
+                    stopAndRestore();
+                }
+            });
+        } catch {
+            // ignore
+        }
+    } catch (e) {
+        console.error("[OkechikaTranslater] unexpected error", e);
+        try {
+            showMappingErrorBanner({ ok: false, error: String(e?.message ?? e) });
+        } catch {
+            // ignore
+        }
+    }
+})();
