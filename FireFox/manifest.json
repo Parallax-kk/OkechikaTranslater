@@ -1,21 +1,23 @@
 {
-    "manifest_version": 3,
+    "manifest_version": 2,
     "name": "OkechikaTranslater",
-    "version": "1.2.0",
-    "description": "地下桶で暗号化されたページのテキストを、スプレッドシートの対応表で置換して表示します。",
+    "version": "0.1.0",
+    "description": "換字で暗号化されたページの本文テキストを、スプレッドシートの対応表で置換して表示します。",
     "icons": {
         "16": "icons/icon.png",
         "48": "icons/icon.png",
         "128": "icons/icon.png"
     },
     "permissions": [
-        "storage"
-    ],
-    "host_permissions": [
-        "https://docs.google.com/spreadsheets/*"
+        "storage",
+        "https://docs.google.com/spreadsheets/*",
+        "<all_urls>"
     ],
     "background": {
-        "service_worker": "background.js"
+        "scripts": [
+            "background.js"
+        ],
+        "persistent": false
     },
     "content_scripts": [
         {
@@ -32,5 +34,10 @@
             ],
             "run_at": "document_idle"
         }
-    ]
+    ],
+    "applications": {
+        "gecko": {
+            "id": "okechika-translater@example.local"
+        }
+    }
 }
