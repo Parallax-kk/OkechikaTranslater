@@ -10,6 +10,32 @@ const DOC_ID = "13ctjzzbfV6AHE218r-aHGLBq8j4JL0pLOYw1R_pIiTg";
 const SHEET_GID = 676289731;
 
 const STORAGE_KEY = "cipherMapping";
+// スプレッドシートの対応表より「ローカル保存の対応表」を優先したい場合に使うキー。
+// 例: { "一乱丣丄": "公式" }
+const LOCAL_OVERRIDE_KEY = "localOverrideMapping";
+
+function sanitizeMappingObject(obj) {
+    const out = {};
+    if (!obj || typeof obj !== "object") return out;
+    for (const [k, v] of Object.entries(obj)) {
+        const key = String(k ?? "").trim();
+        const val = String(v ?? "");
+        if (!key) continue;
+        // 空文字は「未翻訳」と同じ扱い（上書きしない）
+        if (val.trim().length === 0) continue;
+        out[key] = val;
+    }
+    return out;
+}
+
+async function loadLocalOverrideMapping() {
+    try {
+        const stored = (await EXT.storage.local.get(LOCAL_OVERRIDE_KEY)) ?? {};
+        return sanitizeMappingObject(stored?.[LOCAL_OVERRIDE_KEY]);
+    } catch {
+        return {};
+    }
+}
 
 function buildCsvUrls() {
     if (typeof SHEET_GID !== "number") {
@@ -241,24 +267,28 @@ async function refreshMapping() {
             throw new Error("Mapping is empty (check A列→B列 and sheet contents)");
         }
 
+        // ローカル上書き（特定文字列だけ別の訳語にしたい等）
+        const localOverrides = await loadLocalOverrideMapping();
+        const mergedMapping = { ...mapping, ...localOverrides };
+
         await EXT.storage.local.set({
             [STORAGE_KEY]: {
                 ok: true,
-                mapping,
+                mapping: mergedMapping,
                 fetchedAt: Date.now(),
                 sourceUrl: chosen.url,
                 durationMs: Date.now() - startedAt,
-                count: Object.keys(mapping).length
+                count: Object.keys(mergedMapping).length
             }
         });
 
         console.info("[OkechikaTranslater] refreshMapping ok", {
-            count: Object.keys(mapping).length,
+            count: Object.keys(mergedMapping).length,
             sourceUrl: chosen.url,
             durationMs: Date.now() - startedAt
         });
 
-        return { ok: true, count: Object.keys(mapping).length };
+        return { ok: true, count: Object.keys(mergedMapping).length };
     } catch (e) {
         const status = typeof e?.status === "number" ? e.status : undefined;
         const privateOrAuthRequired = status === 401 || status === 403;

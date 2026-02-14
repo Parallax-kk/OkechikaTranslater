@@ -5,6 +5,51 @@ const DOC_ID = "13ctjzzbfV6AHE218r-aHGLBq8j4JL0pLOYw1R_pIiTg";
 const SHEET_GID = 676289731;
 
 const STORAGE_KEY = "cipherMapping";
+// スプレッドシートの対応表より「ローカル同梱CSVの対応表」を優先したい場合に使う。
+// Chrome/ フォルダ直下に配置すること。
+const LOCAL_OVERRIDE_CSV_PATH = "localOverrideMapping.csv";
+
+function sanitizeMappingObject(obj) {
+    const out = {};
+    if (!obj || typeof obj !== "object") return out;
+    for (const [k, v] of Object.entries(obj)) {
+        const key = String(k ?? "").trim();
+        const val = String(v ?? "");
+        if (!key) continue;
+        // 空文字は「未翻訳」と同じ扱い（上書きしない）
+        if (val.trim().length === 0) continue;
+        out[key] = val;
+    }
+    return out;
+}
+
+async function loadLocalOverrideMapping() {
+    try {
+        const url = chrome.runtime.getURL(LOCAL_OVERRIDE_CSV_PATH);
+        const res = await fetch(url, { cache: "no-store" });
+        if (!res.ok) return {};
+        const text = await res.text();
+        if (!text || text.trim().length === 0) return {};
+
+        const head = text.slice(0, 2000).toLowerCase();
+        if (head.includes("<html") || head.includes("<!doctype html")) return {};
+
+        const rows = parseCsv(text);
+        const mapping = {};
+        for (const cols of rows) {
+            if (!cols || cols.length < 2) continue;
+            const from = String(cols[0] ?? "").trim();
+            const to = String(cols[1] ?? "");
+            if (!from) continue;
+            if (String(to).trim().length === 0) continue;
+            mapping[from] = String(to);
+        }
+
+        return sanitizeMappingObject(mapping);
+    } catch {
+        return {};
+    }
+}
 
 function buildCsvUrls() {
     if (typeof SHEET_GID !== "number") {
@@ -248,24 +293,28 @@ async function refreshMapping() {
             throw new Error("Mapping is empty (check A列→B列 and sheet contents)");
         }
 
+        // ローカル上書き（特定文字列だけ別の訳語にしたい等）
+        const localOverrides = await loadLocalOverrideMapping();
+        const mergedMapping = { ...mapping, ...localOverrides };
+
         await chrome.storage.local.set({
             [STORAGE_KEY]: {
                 ok: true,
-                mapping,
+                mapping: mergedMapping,
                 fetchedAt: Date.now(),
                 sourceUrl: chosen.url,
                 durationMs: Date.now() - startedAt,
-                count: Object.keys(mapping).length
+                count: Object.keys(mergedMapping).length
             }
         });
 
         console.info("[OkechikaTranslater] refreshMapping ok", {
-            count: Object.keys(mapping).length,
+            count: Object.keys(mergedMapping).length,
             sourceUrl: chosen.url,
             durationMs: Date.now() - startedAt
         });
 
-        return { ok: true, count: Object.keys(mapping).length };
+        return { ok: true, count: Object.keys(mergedMapping).length };
     } catch (e) {
         const status = typeof e?.status === "number" ? e.status : undefined;
         const privateOrAuthRequired = status === 401 || status === 403;

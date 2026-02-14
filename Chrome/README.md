@@ -1,4 +1,4 @@
-# OkechikaTranslater v1.1
+# OkechikaTranslater v1.3
 
 桶地下の本文テキストを、Googleスプレッドシートの対応表で置換して表示する Chrome 拡張です。
 

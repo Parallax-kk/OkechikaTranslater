@@ -8,6 +8,11 @@ const IGNORED_TAGS = new Set([
 
 const ENABLED_KEY = "okechikaEnabled";
 
+// Firefox は `browser.*` が Promise ベース。
+// `chrome.*` は callback ベースで、await すると undefined になり得るため、
+// ここでは Promise を返す API を必ず使う。
+const EXT = globalThis.browser ?? globalThis.chrome;
+
 // 同じ箇所に何度も置換が走る（初回＋リトライ＋MutationObserver）ため、
 // 置換後の文字列をさらに置換してしまう連鎖変換（例: 儺→下→確）を防ぐ。
 // span化できないケースでも、元の文字列を保持して常にそこから再計算する。
@@ -17,6 +22,8 @@ function shouldIgnoreTextNode(textNode) {
     const parent = textNode.parentElement;
     if (!parent) return true;
     if (IGNORED_TAGS.has(parent.tagName)) return true;
+    // ルビの注釈側(rt/rp)は翻訳対象にしない
+    if (parent.tagName === "RT" || parent.tagName === "RP") return true;
     const editable = parent.closest("[contenteditable='true']");
     if (editable) {
         // 表示専用ビューアが contenteditable を使うことがあるため、
@@ -97,8 +104,52 @@ function ensureDefaultFontStyle() {
         'system-ui',
         'sans-serif'
     ].join(",");
-    style.textContent = `.okechika-translated{font-family:${fontStack} !important;}`;
+    // ルビ(rt)はページ既定フォントのままにしたいので、翻訳本文側だけフォントを当てる。
+    // ルビ表示がページCSSで崩れることがあるため、最低限の ruby/rt スタイルも付与する。
+    style.textContent = [
+        `.okechika-translated-base{font-family:${fontStack} !important;}`,
+        // コンテナ配下の ruby だけにスタイルを当てる（コンテナ自体は span）
+        `.okechika-translated ruby{ruby-position:over; ruby-align:center;}`,
+        `.okechika-translated ruby rt{font-size:0.6em; line-height:1;}`
+    ].join("\n");
     document.documentElement.appendChild(style);
+}
+
+function createTranslatedRuby(original, translated) {
+    const ruby = document.createElement("ruby");
+    const base = document.createElement("span");
+    base.className = "okechika-translated-base";
+    base.textContent = translated;
+    ruby.appendChild(base);
+    const rt = document.createElement("rt");
+    rt.textContent = original;
+    ruby.appendChild(rt);
+    return ruby;
+}
+
+function createSegmentedTranslationFragment(originalText, replaceFn) {
+    const frag = document.createDocumentFragment();
+    const parts = String(originalText ?? "").split(/(\s+)/);
+    for (const part of parts) {
+        if (!part) continue;
+        if (/^\s+$/.test(part)) {
+            frag.appendChild(document.createTextNode(part));
+            continue;
+        }
+
+        const translated = replaceFn(part);
+        if (translated === part) {
+            frag.appendChild(document.createTextNode(part));
+        } else {
+            frag.appendChild(createTranslatedRuby(part, translated));
+        }
+    }
+    return frag;
+}
+
+function fillTranslatedContainer(containerEl, originalText, replaceFn) {
+    while (containerEl.firstChild) containerEl.removeChild(containerEl.firstChild);
+    containerEl.appendChild(createSegmentedTranslationFragment(originalText, replaceFn));
 }
 
 function canWrapWithSpan(parentEl) {
@@ -122,6 +173,8 @@ function translateRoot(root, replaceFn) {
     let changedNodes = 0;
     const samples = [];
 
+    const processedWrappers = new Set();
+
     for (const textNode of nodes) {
         if (shouldIgnoreTextNode(textNode)) continue;
 
@@ -129,23 +182,51 @@ function translateRoot(root, replaceFn) {
         if (!current || current.trim().length === 0) continue;
 
         const parent = textNode.parentElement;
-        const storedOriginal =
-            parent && parent.classList?.contains("okechika-translated")
-                ? parent.dataset.okechikaOriginal
-                : ORIGINAL_TEXT_BY_NODE.get(textNode);
+        const wrapper = parent?.closest
+            ? parent.closest("span.okechika-translated[data-okechika-original], ruby.okechika-translated[data-okechika-original]")
+            : null;
+
+        // 既に翻訳済みコンテナがある場合は、原文(=コンテナに保持)から一括で再計算して更新する
+        if (wrapper && wrapper.dataset?.okechikaOriginal !== undefined) {
+            if (processedWrappers.has(wrapper)) continue;
+
+            const original = wrapper.dataset.okechikaOriginal;
+            const after = replaceFn(original);
+
+            if (wrapper.tagName === "RUBY") {
+                // 旧形式(ruby直置き)をspanコンテナ形式に変換
+                const container = document.createElement("span");
+                container.className = "okechika-translated";
+                container.dataset.okechikaOriginal = original;
+                ensureDefaultFontStyle();
+                fillTranslatedContainer(container, original, replaceFn);
+                wrapper.replaceWith(container);
+                processedWrappers.add(container);
+            } else {
+                ensureDefaultFontStyle();
+                fillTranslatedContainer(wrapper, original, replaceFn);
+                processedWrappers.add(wrapper);
+            }
+
+            changedNodes++;
+            if (samples.length < 3) {
+                samples.push({ before: String(original).slice(0, 80), after: String(after).slice(0, 80) });
+            }
+            continue;
+        }
+
+        const storedOriginal = ORIGINAL_TEXT_BY_NODE.get(textNode);
         const original = storedOriginal ?? current;
 
         const after = replaceFn(original);
         if (after !== current) {
-            if (parent && parent.classList?.contains("okechika-translated")) {
-                textNode.nodeValue = after;
-            } else if (parent && canWrapWithSpan(parent)) {
+            if (parent && canWrapWithSpan(parent)) {
                 ensureDefaultFontStyle();
-                const span = document.createElement("span");
-                span.className = "okechika-translated";
-                span.dataset.okechikaOriginal = original;
-                span.textContent = after;
-                parent.replaceChild(span, textNode);
+                const container = document.createElement("span");
+                container.className = "okechika-translated";
+                container.dataset.okechikaOriginal = original;
+                fillTranslatedContainer(container, original, replaceFn);
+                parent.replaceChild(container, textNode);
             } else {
                 if (!ORIGINAL_TEXT_BY_NODE.has(textNode)) {
                     ORIGINAL_TEXT_BY_NODE.set(textNode, original);
@@ -232,7 +313,7 @@ function reverseMapping(mapping) {
 
 async function getMappingFromBackground() {
     try {
-        const res = await chrome.runtime.sendMessage({ type: "GET_MAPPING" });
+        const res = await EXT.runtime.sendMessage({ type: "GET_MAPPING" });
         return res ?? null;
     } catch {
         return null;
@@ -241,7 +322,7 @@ async function getMappingFromBackground() {
 
 async function refreshMappingInBackground() {
     try {
-        const res = await chrome.runtime.sendMessage({ type: "REFRESH_MAPPING" });
+        const res = await EXT.runtime.sendMessage({ type: "REFRESH_MAPPING" });
         return res ?? null;
     } catch {
         return null;
@@ -305,7 +386,7 @@ function showMappingErrorBanner(info) {
 
 async function getEnabledFlag() {
     try {
-        const obj = await chrome.storage.local.get(ENABLED_KEY);
+        const obj = (await EXT.storage.local.get(ENABLED_KEY)) ?? {};
         const v = obj?.[ENABLED_KEY];
         return v === undefined ? true : Boolean(v);
     } catch {
@@ -315,12 +396,14 @@ async function getEnabledFlag() {
 
 function restoreTranslatedInRoot(root) {
     try {
-        const spans = root.querySelectorAll?.("span.okechika-translated[data-okechika-original]");
-        if (spans) {
-            for (const span of spans) {
-                const original = span.dataset.okechikaOriginal;
+        const translated = root.querySelectorAll?.(
+            "span.okechika-translated[data-okechika-original], ruby.okechika-translated[data-okechika-original]"
+        );
+        if (translated) {
+            for (const el of translated) {
+                const original = el.dataset.okechikaOriginal;
                 if (original === undefined) continue;
-                span.replaceWith(document.createTextNode(original));
+                el.replaceWith(document.createTextNode(original));
             }
         }
 
@@ -479,6 +562,23 @@ function restoreTranslatedInRoot(root) {
             const pendingRoots = new Set();
             let isApplying = false;
 
+            function isInsideTranslated(node) {
+                try {
+                    if (!node) return false;
+                    const el =
+                        node.nodeType === Node.ELEMENT_NODE
+                            ? node
+                            : node.nodeType === Node.TEXT_NODE
+                                ? node.parentElement
+                                : null;
+                    if (!el) return false;
+                    if (el.classList?.contains("okechika-translated")) return true;
+                    return Boolean(el.closest?.(".okechika-translated"));
+                } catch {
+                    return false;
+                }
+            }
+
             function scheduleTranslate(observer) {
                 if (scheduled) return;
                 scheduled = true;
@@ -492,6 +592,8 @@ function restoreTranslatedInRoot(root) {
                     try {
                         for (const r of roots) {
                             if (!r) continue;
+                            // 拡張が入れた要素配下は監視経由で再翻訳しない
+                            if (isInsideTranslated(r)) continue;
                             if (r.nodeType === Node.ELEMENT_NODE || r.nodeType === Node.DOCUMENT_FRAGMENT_NODE) {
                                 try {
                                     translateRoot(r, replaceFn);
@@ -526,16 +628,22 @@ function restoreTranslatedInRoot(root) {
             }
 
             observer = new MutationObserver((mutations) => {
+                // 翻訳適用中のDOM変更は全て無視（自分で入れた変更が再トリガーになるのを防ぐ）
+                if (isApplying) return;
+
                 for (const m of mutations) {
                     if (m.type === "characterData") {
                         if (m.target?.nodeType === Node.TEXT_NODE) {
-                            pendingRoots.add(m.target.parentElement ?? document.body);
+                            if (!isInsideTranslated(m.target)) {
+                                pendingRoots.add(m.target.parentElement ?? document.body);
+                            }
                         }
                         continue;
                     }
 
                     if (m.type === "childList") {
                         for (const node of m.addedNodes) {
+                            if (isInsideTranslated(node)) continue;
                             if (node.nodeType === Node.ELEMENT_NODE) pendingRoots.add(node);
                             else if (node.nodeType === Node.TEXT_NODE) pendingRoots.add(node.parentElement ?? document.body);
                         }
@@ -558,7 +666,7 @@ function restoreTranslatedInRoot(root) {
 
         // ポップアップの切替に追従
         try {
-            chrome.storage.onChanged.addListener((changes, areaName) => {
+            EXT.storage.onChanged.addListener((changes, areaName) => {
                 if (areaName !== "local") return;
                 if (!changes || !Object.prototype.hasOwnProperty.call(changes, ENABLED_KEY)) return;
                 const newValue = changes[ENABLED_KEY]?.newValue;
