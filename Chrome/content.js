@@ -8,6 +8,11 @@ const IGNORED_TAGS = new Set([
 
 const ENABLED_KEY = "okechikaEnabled";
 
+// 同じ箇所に何度も置換が走る（初回＋リトライ＋MutationObserver）ため、
+// 置換後の文字列をさらに置換してしまう連鎖変換（例: 儺→下→確）を防ぐ。
+// span化できないケースでも、元の文字列を保持して常にそこから再計算する。
+const ORIGINAL_TEXT_BY_NODE = new WeakMap();
+
 function shouldIgnoreTextNode(textNode) {
     const parent = textNode.parentElement;
     if (!parent) return true;
@@ -120,27 +125,36 @@ function translateRoot(root, replaceFn) {
     for (const textNode of nodes) {
         if (shouldIgnoreTextNode(textNode)) continue;
 
-        const before = textNode.nodeValue;
-        if (!before || before.trim().length === 0) continue;
+        const current = textNode.nodeValue;
+        if (!current || current.trim().length === 0) continue;
 
-        const after = replaceFn(before);
-        if (after !== before) {
-            const parent = textNode.parentElement;
+        const parent = textNode.parentElement;
+        const storedOriginal =
+            parent && parent.classList?.contains("okechika-translated")
+                ? parent.dataset.okechikaOriginal
+                : ORIGINAL_TEXT_BY_NODE.get(textNode);
+        const original = storedOriginal ?? current;
+
+        const after = replaceFn(original);
+        if (after !== current) {
             if (parent && parent.classList?.contains("okechika-translated")) {
                 textNode.nodeValue = after;
             } else if (parent && canWrapWithSpan(parent)) {
                 ensureDefaultFontStyle();
                 const span = document.createElement("span");
                 span.className = "okechika-translated";
-                span.dataset.okechikaOriginal = before;
+                span.dataset.okechikaOriginal = original;
                 span.textContent = after;
                 parent.replaceChild(span, textNode);
             } else {
+                if (!ORIGINAL_TEXT_BY_NODE.has(textNode)) {
+                    ORIGINAL_TEXT_BY_NODE.set(textNode, original);
+                }
                 textNode.nodeValue = after;
             }
             changedNodes++;
             if (samples.length < 3) {
-                samples.push({ before: before.slice(0, 80), after: after.slice(0, 80) });
+                samples.push({ before: String(original).slice(0, 80), after: String(after).slice(0, 80) });
             }
         }
     }
@@ -163,12 +177,13 @@ function translateFormFields(root, replaceFn) {
             // 入力中は触らない
             if (isActive) continue;
 
-            const before = tag === "TEXTAREA" ? el.value : el.value;
-            if (!before || before.trim().length === 0) continue;
+            const current = tag === "TEXTAREA" ? el.value : el.value;
+            if (!current || current.trim().length === 0) continue;
 
-            const after = replaceFn(before);
-            if (after !== before) {
-                if (!el.dataset.okechikaOriginal) el.dataset.okechikaOriginal = before;
+            const original = el.dataset.okechikaOriginal ?? current;
+            const after = replaceFn(original);
+            if (after !== current) {
+                if (!el.dataset.okechikaOriginal) el.dataset.okechikaOriginal = original;
                 el.value = after;
                 try {
                     // フィールド自体も暗号用フォントを避ける
