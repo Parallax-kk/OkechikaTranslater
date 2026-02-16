@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="ja">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OkechikaTranslater</title>
+    <style>
+        :root {
+            color-scheme: light dark;
+        }
+
+        body {
+            margin: 0;
+            padding: 12px;
+            font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+            min-width: 220px;
+        }
+
+        .row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+        }
+
+        .title {
+            font-weight: 600;
+            margin: 0 0 10px;
+        }
+
+        .status {
+            opacity: 0.85;
+        }
+
+        label {
+            user-select: none;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="title">OkechikaTranslater</div>
+
+    <div class="row">
+        <label for="enabled">翻訳を有効にする</label>
+        <input id="enabled" type="checkbox" />
+    </div>
+
+    <div class="row" style="margin-top:10px;">
+        <label for="domainOnly">桶地下サイトのみ翻訳</label>
+        <input id="domainOnly" type="checkbox" />
+    </div>
+
+    <div class="row" style="margin-top:10px;">
+        <label for="rubySwap">ルビ表示を入れ替える</label>
+        <input id="rubySwap" type="checkbox" />
+    </div>
+    <div class="status" id="status" aria-live="polite" style="margin-top:8px;"></div>
+
+    <script src="popup.js"></script>
+</body>
+
+</html>

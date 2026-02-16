@@ -7,11 +7,76 @@ const IGNORED_TAGS = new Set([
 ]);
 
 const ENABLED_KEY = "okechikaEnabled";
+const RUBY_SWAP_KEY = "okechikaRubySwap";
+const DOMAIN_ONLY_KEY = "okechikaDomainOnly";
+
+// 「桶地下サイトのみ翻訳」がONのときに翻訳を許可するドメイン
+const ALLOWED_HOSTS = new Set([
+    "0cacd3226ad7.ngrok.app",
+    "www.qtes9gu0k.xyz"
+]);
 
 // 同じ箇所に何度も置換が走る（初回＋リトライ＋MutationObserver）ため、
 // 置換後の文字列をさらに置換してしまう連鎖変換（例: 儺→下→確）を防ぐ。
 // span化できないケースでも、元の文字列を保持して常にそこから再計算する。
 const ORIGINAL_TEXT_BY_NODE = new WeakMap();
+
+// false: 本文=翻訳後 / ルビ=原文（従来）
+// true:  本文=原文 / ルビ=翻訳後
+let rubySwap = false;
+let domainOnly = true;
+
+function isAllowedOkechikaSite() {
+    const isAllowed = (proto, host) => {
+        const p = String(proto ?? "");
+        const h = String(host ?? "").toLowerCase();
+        if (p !== "http:" && p !== "https:") return false;
+        if (!h) return false;
+        return ALLOWED_HOSTS.has(h);
+    };
+
+    // 1) まずは「このフレーム自身のURL」で判定
+    try {
+        if (isAllowed(location?.protocol, location?.hostname)) return true;
+    } catch {
+        // ignore
+    }
+
+    // 2) same-origin の場合は top のURLで判定（srcdoc/about:blank iframe で有効）
+    try {
+        if (window.top && window.top !== window) {
+            if (isAllowed(window.top.location.protocol, window.top.location.hostname)) return true;
+        }
+    } catch {
+        // cross-origin の場合は例外になるため無視
+    }
+
+    // 3) ancestorOrigins / referrer から推測して判定
+    const candidates = [];
+    try {
+        const ao = location?.ancestorOrigins;
+        if (ao && ao.length) candidates.push(...ao);
+    } catch {
+        // ignore
+    }
+
+    try {
+        if (document.referrer) candidates.push(document.referrer);
+    } catch {
+        // ignore
+    }
+
+    for (let i = candidates.length - 1; i >= 0; i--) {
+        try {
+            const u = new URL(candidates[i]);
+            if (isAllowed(u.protocol, u.hostname)) return true;
+        } catch {
+            // ignore
+        }
+    }
+
+    return false;
+}
 
 function shouldIgnoreTextNode(textNode) {
     const parent = textNode.parentElement;
@@ -113,11 +178,15 @@ function ensureDefaultFontStyle() {
 function createTranslatedRuby(original, translated) {
     const ruby = document.createElement("ruby");
     const base = document.createElement("span");
-    base.className = "okechika-translated-base";
-    base.textContent = translated;
+    // ルビ表示入替時はフォントも入替える
+    // - 通常: 本文(翻訳後)に読みやすいフォントを適用
+    // - 入替: 本文(原文)はページ既定フォント、ルビ(翻訳後)に読みやすいフォントを適用
+    base.className = rubySwap ? "" : "okechika-translated-base";
+    base.textContent = rubySwap ? original : translated;
     ruby.appendChild(base);
     const rt = document.createElement("rt");
-    rt.textContent = original;
+    rt.className = rubySwap ? "okechika-translated-base" : "";
+    rt.textContent = rubySwap ? translated : original;
     ruby.appendChild(rt);
     return ruby;
 }
@@ -390,6 +459,26 @@ async function getEnabledFlag() {
     }
 }
 
+async function getRubySwapFlag() {
+    try {
+        const obj = await chrome.storage.local.get(RUBY_SWAP_KEY);
+        const v = obj?.[RUBY_SWAP_KEY];
+        return v === undefined ? false : Boolean(v);
+    } catch {
+        return false;
+    }
+}
+
+async function getDomainOnlyFlag() {
+    try {
+        const obj = await chrome.storage.local.get(DOMAIN_ONLY_KEY);
+        const v = obj?.[DOMAIN_ONLY_KEY];
+        return v === undefined ? true : Boolean(v);
+    } catch {
+        return true;
+    }
+}
+
 function restoreTranslatedInRoot(root) {
     try {
         const translated = root.querySelectorAll?.(
@@ -436,6 +525,8 @@ function restoreTranslatedInRoot(root) {
         }
 
         let enabled = await getEnabledFlag();
+        rubySwap = await getRubySwapFlag();
+        domainOnly = await getDomainOnlyFlag();
         let observer = null;
         let replaceFn = null;
 
@@ -455,6 +546,7 @@ function restoreTranslatedInRoot(root) {
 
         async function startIfNeeded() {
             if (!enabled) return;
+            if (domainOnly && !isAllowedOkechikaSite()) return;
             if (observer) return;
 
             // まずは対応表の更新を試みる（onInstalled/onStartup が走っていない場合もあるため）
@@ -517,6 +609,15 @@ function restoreTranslatedInRoot(root) {
                 }
 
                 return { changedTextNodes, changedFields, sampleChanges: sampleChanges.slice(0, 3) };
+            }
+
+            function rerenderAllRoots() {
+                if (!replaceFn) return;
+                try {
+                    translateAllRoots(replaceFn);
+                } catch {
+                    // ignore
+                }
             }
 
             // 初回翻訳
@@ -655,6 +756,9 @@ function restoreTranslatedInRoot(root) {
                 subtree: true,
                 characterData: true
             });
+
+            // startIfNeeded の呼び出しスコープ内でのみ使われるので、参照を残す
+            startIfNeeded.rerenderAllRoots = rerenderAllRoots;
         }
 
         // 初期状態に応じて開始
@@ -664,15 +768,44 @@ function restoreTranslatedInRoot(root) {
         try {
             chrome.storage.onChanged.addListener((changes, areaName) => {
                 if (areaName !== "local") return;
-                if (!changes || !Object.prototype.hasOwnProperty.call(changes, ENABLED_KEY)) return;
-                const newValue = changes[ENABLED_KEY]?.newValue;
-                const next = newValue === undefined ? true : Boolean(newValue);
-                if (next === enabled) return;
-                enabled = next;
-                if (enabled) {
-                    startIfNeeded();
-                } else {
-                    stopAndRestore();
+                if (!changes) return;
+
+                if (Object.prototype.hasOwnProperty.call(changes, ENABLED_KEY)) {
+                    const newValue = changes[ENABLED_KEY]?.newValue;
+                    const next = newValue === undefined ? true : Boolean(newValue);
+                    if (next !== enabled) {
+                        enabled = next;
+                        if (enabled) startIfNeeded();
+                        else stopAndRestore();
+                    }
+                }
+
+                if (Object.prototype.hasOwnProperty.call(changes, RUBY_SWAP_KEY)) {
+                    const newValue = changes[RUBY_SWAP_KEY]?.newValue;
+                    const next = newValue === undefined ? false : Boolean(newValue);
+                    if (next !== rubySwap) {
+                        rubySwap = next;
+                        if (enabled) {
+                            // 既存の翻訳DOMを入れ替え反映
+                            try {
+                                startIfNeeded.rerenderAllRoots?.();
+                            } catch {
+                                // ignore
+                            }
+                        }
+                    }
+                }
+
+                if (Object.prototype.hasOwnProperty.call(changes, DOMAIN_ONLY_KEY)) {
+                    const newValue = changes[DOMAIN_ONLY_KEY]?.newValue;
+                    const next = newValue === undefined ? true : Boolean(newValue);
+                    if (next !== domainOnly) {
+                        domainOnly = next;
+                        if (enabled) {
+                            if (domainOnly && !isAllowedOkechikaSite()) stopAndRestore();
+                            else startIfNeeded();
+                        }
+                    }
                 }
             });
         } catch {
